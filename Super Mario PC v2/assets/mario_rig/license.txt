@@ -1,0 +1,11 @@
+Model Information:
+* title:	Super Mario 64, Rigged and fixed textures
+* source:	https://sketchfab.com/3d-models/super-mario-64-rigged-and-fixed-textures-c4016c4356e94a3cac7e54f5c7e5eb61
+* author:	yO_ey (https://sketchfab.com/adrianandersen)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Super Mario 64, Rigged and fixed textures" (https://sketchfab.com/3d-models/super-mario-64-rigged-and-fixed-textures-c4016c4356e94a3cac7e54f5c7e5eb61) by yO_ey (https://sketchfab.com/adrianandersen) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

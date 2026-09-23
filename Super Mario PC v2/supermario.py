@@ -4,6 +4,7 @@ import random
 import socket
 import sys
 import time
+from pathlib import Path
 from array import array
 
 import pygame
@@ -17,6 +18,13 @@ HORIZON = 220
 WORLD_END = 116
 LOBBY_BUTTON_Z = 24
 PROFILE_FILE = "player_profile.json"
+WORLD_THEME_FILE = "mario theme.ogg"
+FLOOR_TEXTURE_FILE = "floor.jpg"
+COIN_TEXTURE_FILE = "coin.png"
+COIN_SOUND_FILE = "coin.wav"
+JUMP_SOUND_FILE = "jump.wav"
+DIE_SOUND_FILE = "die.wav"
+KILL_SOUND_FILE = "kill.wav"
 
 SKY = (92, 180, 235)
 INK = (25, 31, 52)
@@ -27,13 +35,122 @@ GOLD = (255, 211, 48)
 GRASS = (66, 176, 78)
 DIRT = (143, 81, 46)
 
+MARIO_MODEL_DIR = Path(__file__).resolve().parent / "assets" / "mario_rig_64"
+GOOMBA_TEXTURE_FILE = Path(__file__).resolve().parent / "assets" / "goomba" / "goomba_texture.png"
+GOOMBA_ANIMATION_FILE = Path(__file__).resolve().parent / "assets" / "goomba" / "goomba_animation.json"
+MARIO_MATERIAL_COLORS = ((48, 78, 177), (216, 45, 48), WHITE, (245, 244, 232),
+                         (247, 190, 140), (101, 56, 31), (216, 45, 48))
+
+
+def apply_static_mario_pose(name, source_positions, indices):
+    """Bend the source T-pose arms down once, without playing an animation."""
+    positions = [list(vertex) for vertex in source_positions]
+    mesh_name = name.lower()
+    if "mario64hand" in mesh_name:
+        side = 1 if sum(vertex[0] for vertex in positions) >= 0 else -1
+        arm_groups = (range(len(positions)),)
+    elif mesh_name == "mario__bodymt":
+        parents = list(range(len(positions)))
+
+        def find_root(vertex_index):
+            while parents[vertex_index] != vertex_index:
+                parents[vertex_index] = parents[parents[vertex_index]]
+                vertex_index = parents[vertex_index]
+            return vertex_index
+
+        for index in range(0, len(indices) - 2, 3):
+            first, second, third = indices[index:index + 3]
+            first_root, second_root, third_root = (find_root(first), find_root(second),
+                                                   find_root(third))
+            parents[second_root] = first_root
+            parents[third_root] = first_root
+        components = {}
+        for vertex_index in set(indices):
+            components.setdefault(find_root(vertex_index), []).append(vertex_index)
+        arm_groups = []
+        for component in components.values():
+            component_vertices = [positions[index] for index in component]
+            center_x = sum(vertex[0] for vertex in component_vertices) / len(component_vertices)
+            min_y = min(vertex[1] for vertex in component_vertices)
+            if min_y > 1.65 and abs(center_x) > 0.2:
+                arm_groups.append(component)
+    else:
+        return positions
+
+    for group in arm_groups:
+        if "mario64hand" not in mesh_name:
+            center_x = sum(positions[index][0] for index in group) / len(group)
+            side = 1 if center_x > 0 else -1
+        pivot_x, pivot_y = side * 0.4, 1.9
+        angle = math.radians(-60 * side)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        for vertex_index in group:
+            x, y, _ = positions[vertex_index]
+            offset_x, offset_y = x - pivot_x, y - pivot_y
+            positions[vertex_index][0] = pivot_x + offset_x * cosine - offset_y * sine
+            positions[vertex_index][1] = pivot_y + offset_x * sine + offset_y * cosine
+    return positions
+
+
+def load_mario_meshes():
+    """Load the new Mario 64 mesh in a static bind pose for the lightweight renderer."""
+    try:
+        model = json.loads((MARIO_MODEL_DIR / "mario_static.json").read_text(encoding="utf-8"))
+        materials = [MARIO_MODEL_DIR / material["texture"] if material.get("texture") else None
+                     for material in model["materials"]]
+        meshes = []
+        hand_meshes = []
+        for part in model["parts"]:
+            material = part["material"]
+            base_color = MARIO_MATERIAL_COLORS[material % len(MARIO_MATERIAL_COLORS)]
+            positions = apply_static_mario_pose(part.get("name", ""),
+                                                part["positions"], part["indices"])
+            mesh = (positions, part["indices"], base_color,
+                    part["uvs"], material)
+            meshes.append(mesh)
+            if "mario64hand" in part.get("name", "").lower():
+                hand_meshes.append(mesh)
+        return meshes, materials, hand_meshes
+    except (OSError, KeyError, ValueError, IndexError, TypeError):
+        return [], [], []
+
+
+MARIO_MESHES, MARIO_MATERIAL_FILES, MARIO_HAND_MESHES = load_mario_meshes()
+
+
+def load_goomba_animation():
+    try:
+        data = json.loads(GOOMBA_ANIMATION_FILE.read_text(encoding="utf-8"))
+        if data.get("frames") and data.get("indices") and data.get("uvs"):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+GOOMBA_ANIMATION = load_goomba_animation()
+
 
 def make_textures(character_style=0):
     textures = {}
+    textures["mario_materials"] = []
+    for texture_path in MARIO_MATERIAL_FILES:
+        try:
+            textures["mario_materials"].append(
+                pygame.image.load(str(texture_path)).convert_alpha() if texture_path else None)
+        except (pygame.error, OSError):
+            textures["mario_materials"].append(None)
     grass = pygame.Surface((16, 16))
     grass.fill((67, 167, 72))
     for x, y in ((2, 3), (8, 5), (13, 2), (5, 12), (11, 10)):
         pygame.draw.rect(grass, (38, 123, 61), (x, y, 2, 3))
+    # Use the supplied brick image for the large ground platform.  Keep the
+    # generated grass available as a fallback if the image is unavailable.
+    try:
+        floor = pygame.image.load(FLOOR_TEXTURE_FILE).convert()
+        textures["floor"] = floor
+    except (pygame.error, OSError):
+        textures["floor"] = grass
     textures["grass"] = grass
 
     brick = pygame.Surface((16, 16))
@@ -66,9 +183,6 @@ def make_textures(character_style=0):
     cap_color = style_colors[character_style % len(style_colors)]
     cap = pygame.Surface((16, 16))
     cap.fill(cap_color)
-    pygame.draw.rect(cap, shade(cap_color, 42), (2, 8, 12, 4))
-    pygame.draw.circle(cap, WHITE, (8, 6), 3)
-    pygame.draw.line(cap, RED, (8, 4), (8, 8), 1)
     textures["cap"] = cap
 
     shoe = pygame.Surface((16, 16))
@@ -76,17 +190,46 @@ def make_textures(character_style=0):
     pygame.draw.rect(shoe, (178, 94, 45), (2, 2, 12, 4))
     textures["shoe"] = shoe
 
+    glove = pygame.Surface((16, 16))
+    glove.fill((245, 244, 232))
+    pygame.draw.rect(glove, (209, 214, 222), (1, 11, 14, 4))
+    textures["glove"] = glove
+
+    hair = pygame.Surface((16, 16))
+    hair.fill((91, 46, 30))
+    pygame.draw.rect(hair, (143, 76, 39), (2, 2, 12, 4))
+    textures["hair"] = hair
+
     coin = pygame.Surface((16, 16))
     coin.fill((245, 182, 34))
     pygame.draw.rect(coin, (255, 239, 115), (3, 1, 10, 14), 2)
     pygame.draw.line(coin, (255, 250, 180), (6, 3), (6, 12), 2)
     textures["coin"] = coin
+    try:
+        coin_sprite = pygame.image.load(COIN_TEXTURE_FILE).convert_alpha()
+        coin_bounds = coin_sprite.get_bounding_rect()
+        textures["coin_sprite"] = coin_sprite.subsurface(coin_bounds).copy()
+    except (pygame.error, OSError, ValueError):
+        textures["coin_sprite"] = None
+    textures["coin_sprite_cache"] = {}
 
     enemy = pygame.Surface((16, 16))
     enemy.fill((137, 76, 46))
-    pygame.draw.rect(enemy, (247, 226, 184), (3, 5, 3, 3))
-    pygame.draw.rect(enemy, (247, 226, 184), (10, 5, 3, 3))
     textures["enemy"] = enemy
+    try:
+        atlas = pygame.image.load(str(GOOMBA_TEXTURE_FILE)).convert_alpha()
+        # Fallback 2D face crop from the supplied model's upper-left atlas region.
+        face = atlas.subsurface((100, 100, 300, 300)).copy()
+        face_mask = pygame.Surface(face.get_size(), pygame.SRCALPHA)
+        pygame.draw.ellipse(face_mask, (255, 255, 255, 255), face_mask.get_rect())
+        face.blit(face_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        textures["enemy_face"] = face
+    except (pygame.error, OSError, ValueError):
+        textures["enemy_face"] = None
+    try:
+        textures["goomba_model"] = pygame.image.load(str(GOOMBA_TEXTURE_FILE)).convert_alpha()
+    except (pygame.error, OSError, ValueError):
+        textures["goomba_model"] = None
 
     shell = pygame.Surface((16, 16))
     shell.fill((47, 143, 82))
@@ -174,18 +317,44 @@ def make_music():
 def setup_audio():
     try:
         pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+        try:
+            coin_sound = pygame.mixer.Sound(COIN_SOUND_FILE)
+        except (pygame.error, OSError):
+            coin_sound = make_tone(880, 0.1, end_frequency=1320)
+        try:
+            jump_sound = pygame.mixer.Sound(JUMP_SOUND_FILE)
+        except (pygame.error, OSError):
+            jump_sound = make_tone(440, 0.16, end_frequency=720)
+        try:
+            kill_sound = pygame.mixer.Sound(KILL_SOUND_FILE)
+        except (pygame.error, OSError):
+            kill_sound = make_tone(170, 0.14, end_frequency=90)
+        try:
+            die_sound = pygame.mixer.Sound(DIE_SOUND_FILE)
+        except (pygame.error, OSError):
+            die_sound = make_tone(180, 0.28, end_frequency=70)
         sounds = {
-            "jump": make_tone(440, 0.16, end_frequency=720),
-            "coin": make_tone(880, 0.1, end_frequency=1320),
-            "stomp": make_tone(170, 0.14, end_frequency=90),
-            "hurt": make_tone(180, 0.28, end_frequency=70),
+            "jump": jump_sound,
+            "coin": coin_sound,
+            "stomp": kill_sound,
+            "hurt": die_sound,
         }
-        music = make_music()
-        music.set_volume(0.28)
-        music.play(-1)
-        return sounds, music
+        try:
+            pygame.mixer.music.load(WORLD_THEME_FILE)
+            pygame.mixer.music.set_volume(0.28)
+        except (pygame.error, OSError):
+            pass
+        return sounds
+    except (pygame.error, OSError):
+        return {}
+
+
+def play_world_theme():
+    """Start the main theme when the player enters a world."""
+    try:
+        pygame.mixer.music.play(-1)
     except pygame.error:
-        return {}, None
+        pass
 
 
 class NetworkSession:
@@ -195,18 +364,29 @@ class NetworkSession:
         self.name = name
         self.mode = mode
         self.port = int(port or NetworkSession.port)
-        self.address = (address, self.port)
+        resolved_address = socket.gethostbyname(address) if mode == "join" else address
+        self.address = (resolved_address, self.port)
         self.player_id = f"{name}-{random.randrange(100000, 999999)}"
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setblocking(False)
         local_port = self.port if mode == "host" else 0
-        self.socket.bind(("0.0.0.0", local_port))
+        try:
+            self.socket.bind(("0.0.0.0", local_port))
+        except OSError:
+            self.socket.close()
+            raise
         self.peers = {}
         self.players = {}
         self.chat_messages = []
         self.last_send = 0.0
         self.last_seen = 0.0
         self.game_started = False
+
+    def send_packet(self, packet, destination):
+        try:
+            self.socket.sendto(packet, destination)
+        except OSError:
+            pass
 
     def send_chat(self, text):
         message = {
@@ -218,9 +398,9 @@ class NetworkSession:
         packet = json.dumps(message).encode("utf-8")
         if self.mode == "host":
             for peer in self.peers.values():
-                self.socket.sendto(packet, peer)
+                self.send_packet(packet, peer)
         else:
-            self.socket.sendto(packet, self.address)
+            self.send_packet(packet, self.address)
 
     def drain_chat(self):
         messages = self.chat_messages
@@ -241,10 +421,10 @@ class NetworkSession:
         if now - self.last_send > 0.05:
             destination = None if self.mode == "host" else self.address
             if destination:
-                self.socket.sendto(packet, destination)
+                self.send_packet(packet, destination)
             else:
                 for peer in self.peers.values():
-                    self.socket.sendto(packet, peer)
+                    self.send_packet(packet, peer)
             self.last_send = now
 
         while True:
@@ -252,18 +432,22 @@ class NetworkSession:
                 raw, sender = self.socket.recvfrom(4096)
             except BlockingIOError:
                 break
+            except OSError:
+                break
             try:
                 message = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if self.mode == "host" and message.get("kind") == "state":
-                self.peers[message.get("id", "")] = sender
-                self.players[message.get("id", "")] = (message, now)
-                self.last_seen = now
+                peer_id = message.get("id")
+                if isinstance(peer_id, str) and peer_id and peer_id != self.player_id:
+                    self.peers[peer_id] = sender
+                    self.players[peer_id] = (message, now)
+                    self.last_seen = now
             elif self.mode == "host" and message.get("kind") == "chat":
                 self.chat_messages.append(message)
                 for peer in self.peers.values():
-                    self.socket.sendto(raw, peer)
+                    self.send_packet(raw, peer)
             elif self.mode == "join" and message.get("kind") == "snapshot":
                 self.players = {item["id"]: (item, now) for item in message.get("players", [])}
                 self.last_seen = now
@@ -274,6 +458,10 @@ class NetworkSession:
 
         if self.mode == "host":
             self.players[self.player_id] = ({"id": self.player_id, "name": self.name, "x": x, "y": y, "z": z}, now)
+            for player_id, (_, updated) in list(self.players.items()):
+                if player_id != self.player_id and now - updated >= 3:
+                    self.players.pop(player_id, None)
+                    self.peers.pop(player_id, None)
             if lobby:
                 ready_players = [item for item, updated in self.players.values() if item.get("lobby") and item.get("z", 0) >= LOBBY_BUTTON_Z - 2]
                 expected_players = len(self.peers) + 1
@@ -281,13 +469,13 @@ class NetworkSession:
                     self.game_started = True
                     start_packet = json.dumps({"kind": "start"}).encode("utf-8")
                     for peer in self.peers.values():
-                        self.socket.sendto(start_packet, peer)
+                        self.send_packet(start_packet, peer)
             snapshot = json.dumps({
                 "kind": "snapshot",
                 "players": [item for item, updated in self.players.values() if now - updated < 3],
             }).encode("utf-8")
             for peer in self.peers.values():
-                self.socket.sendto(snapshot, peer)
+                self.send_packet(snapshot, peer)
 
         return [item for player_id, (item, updated) in self.players.items()
                 if player_id != self.player_id and now - updated < 3]
@@ -296,7 +484,7 @@ class NetworkSession:
         self.socket.close()
 
     def status(self):
-        return "CONNECTED" if self.last_seen else "WAITING FOR HOST..."
+        return "CONNECTED" if self.last_seen and time.monotonic() - self.last_seen < 3 else "WAITING FOR HOST..."
 
 
 def project(point, camera):
@@ -316,7 +504,18 @@ def project(point, camera):
     return (int(SCREEN_WIDTH / 2 + view_x * scale), int(HORIZON - view_y * scale))
 
 
-def cube_polygons(center, size, camera):
+def camera_space_depth(point, camera):
+    """Return a point's forward distance from the active camera."""
+    x, y, z = point
+    yaw = camera[3] if len(camera) > 3 else 0
+    pitch = camera[4] if len(camera) > 4 else 0
+    relative_x = x - camera[0]
+    relative_z = z - camera[2]
+    flat_depth = relative_x * math.sin(yaw) + relative_z * math.cos(yaw)
+    return flat_depth * math.cos(pitch) + (y - camera[1]) * math.sin(pitch)
+
+
+def cube_polygons(center, size, camera, exclude_top=False):
     cx, cy, cz = center
     width, height, depth = size
     x0, x1 = cx - width / 2, cx + width / 2
@@ -330,7 +529,9 @@ def cube_polygons(center, size, camera):
     yaw = camera[3] if len(camera) > 3 else 0
     pitch = camera[4] if len(camera) > 4 else 0
     polygons = []
-    for face in faces:
+    for face_index, face in enumerate(faces):
+        if exclude_top and face_index == 4:
+            continue
         camera_depths = []
         for index in face:
             vertex_x, vertex_y, vertex_z = vertices[index]
@@ -364,16 +565,17 @@ def draw_3d_line(screen, camera, start, end, color, width):
         pygame.draw.line(screen, color, first, second, width)
 
 
-def draw_shadow(screen, camera, x, z, width=0.8):
+def draw_shadow(screen, camera, x, z, width=0.8, ground_y=0):
     yaw = camera[3] if len(camera) > 3 else 0
     pitch = camera[4] if len(camera) > 4 else 0
     relative_x = x - camera[0]
     relative_z = z - camera[2]
     flat_depth = relative_x * math.sin(yaw) + relative_z * math.cos(yaw)
-    camera_depth = flat_depth * math.cos(pitch) + (0.06 - camera[1]) * math.sin(pitch)
+    shadow_y = ground_y + 0.06
+    camera_depth = flat_depth * math.cos(pitch) + (shadow_y - camera[1]) * math.sin(pitch)
     if camera_depth <= 1.0:
         return
-    point = project((x, 0.06, z), camera)
+    point = project((x, shadow_y, z), camera)
     if point:
         radius = min(72, max(5, int(FOCAL_LENGTH / camera_depth * width)))
         alpha = max(35, min(125, int(125 * min(1, camera_depth / 12))))
@@ -443,17 +645,128 @@ def update_test_npcs(npcs):
             npc["z"] = max(4, min(WORLD_END - 4, npc["z"]))
 
 
+def draw_mario_model(screen, camera, x, y, z, textures, facing_yaw=0.0, show_face=False, ground_y=None, graphics_quality=2):
+    """Draw Mario facing his movement direction, rather than the camera."""
+    if MARIO_MESHES:
+        vertices = [vertex for positions, _, _, _, _ in MARIO_MESHES for vertex in positions]
+        min_x, max_x = min(v[0] for v in vertices), max(v[0] for v in vertices)
+        min_y, max_y = min(v[1] for v in vertices), max(v[1] for v in vertices)
+        min_z, max_z = min(v[2] for v in vertices), max(v[2] for v in vertices)
+        # Normalize the source model around its feet and fit the game's 2.1-unit character height.
+        scale = 2.1 / max(0.001, max_y - min_y)
+        center_x, center_z = (min_x + max_x) / 2, (min_z + max_z) / 2
+        right_x, right_z = math.cos(facing_yaw), -math.sin(facing_yaw)
+        forward_x, forward_z = math.sin(facing_yaw), math.cos(facing_yaw)
+        if graphics_quality >= 2:
+            draw_shadow(screen, camera, x, z, 0.72, y if ground_y is None else ground_y)
+        polygons = []
+        material_textures = textures.get("mario_materials", ())
+        for positions, indices, color, uvs, material_index in MARIO_MESHES:
+            for index in range(0, len(indices) - 2, 3):
+                points3 = []
+                triangle_indices = indices[index:index + 3]
+                for vertex_index in triangle_indices:
+                    vx, vy, vz = positions[vertex_index]
+                    lx, lz = (vx - center_x) * scale, (vz - center_z) * scale
+                    points3.append((x + lx * right_x + lz * forward_x,
+                                    y + (vy - min_y) * scale,
+                                    z + lx * right_z + lz * forward_z))
+                points2 = [project(point, camera) for point in points3]
+                if all(points2):
+                    depth = sum(camera_space_depth(point, camera) for point in points3) / 3
+                    face_color = color
+                    material_texture = (material_textures[material_index]
+                                        if material_index < len(material_textures) else None)
+                    if graphics_quality < 2 or material_index == 3:
+                        material_texture = None
+                    if material_texture:
+                        u = sum(uvs[i][0] for i in triangle_indices) / 3
+                        v = sum(uvs[i][1] for i in triangle_indices) / 3
+                        tx = int((u % 1.0) * (material_texture.get_width() - 1))
+                        ty = int(((1 - v) % 1.0) * (material_texture.get_height() - 1))
+                        texel = material_texture.get_at((tx, ty))
+                        if texel.a < 16:
+                            continue
+                        face_color = tuple(texel[i] for i in range(3))
+                    polygons.append((depth, points2, face_color))
+        for _, polygon, color in sorted(polygons, key=lambda item: item[0], reverse=True):
+            pygame.draw.polygon(screen, color, polygon)
+        return
+
+    right_x, right_z = math.cos(facing_yaw), -math.sin(facing_yaw)
+    forward_x, forward_z = math.sin(facing_yaw), math.cos(facing_yaw)
+
+    def point(local_x, local_y, local_forward=0):
+        return (x + local_x * right_x + local_forward * forward_x,
+                y + local_y,
+                z + local_x * right_z + local_forward * forward_z)
+
+    def cube(local_x, local_y, local_forward, size, texture, scale=0):
+        width, height, depth = size
+        # Axis-aligned cubes approximate the rotated model while retaining the
+        # renderer's simple, fast cube drawing.
+        rotated_size = (abs(width * right_x) + abs(depth * forward_x), height,
+                        abs(width * right_z) + abs(depth * forward_z))
+        draw_model_cube(screen, camera, point(local_x, local_y, local_forward), rotated_size, texture, scale)
+
+    if graphics_quality >= 2:
+        draw_shadow(screen, camera, x, z, 0.72, y if ground_y is None else ground_y)
+    for leg_x in (-0.29, 0.29):
+        cube(leg_x, 0.05, 0.03, (0.34, 0.58, 0.42), textures["overalls"], -3)
+        cube(leg_x, 0.01, -0.07, (0.46, 0.18, 0.50), textures["shoe"], -2)
+
+    cube(0, 0.56, 0, (1.02, 0.78, 0.62), textures["mario"], -2)
+    cube(0, 0.70, 0.33, (0.78, 0.53, 0.10), textures["overalls"], 2)
+    # A blue rear panel keeps Mario recognizable when the third-person camera
+    # follows behind him.
+    cube(0, 0.70, -0.33, (0.86, 0.60, 0.10), textures["overalls"], 1)
+    for arm_x in (-0.61, 0.61):
+        cube(arm_x, 0.75, -0.01, (0.24, 0.52, 0.40), textures["mario"], -1)
+        cube(arm_x, 0.57, -0.10, (0.25, 0.25, 0.33), textures["glove"], 1)
+
+    cube(0, 1.34, 0, (0.84, 0.70, 0.66), textures["skin"], 3)
+    for hair_x in (-0.43, 0.43):
+        cube(hair_x, 1.45, 0.19, (0.14, 0.42, 0.18), textures["hair"], -1)
+    cube(0, 1.48, -0.35, (0.66, 0.34, 0.10), textures["hair"], -2)
+    cube(0, 1.94, 0, (0.98, 0.24, 0.72), textures["cap"], 1)
+    cube(0, 1.92, 0.40, (1.10, 0.10, 0.18), textures["cap"], -1)
+
+    if not show_face:
+        return
+
+    cube(0, 1.59, 0.38, (0.18, 0.21, 0.16), textures["skin"], 7)
+    for mustache_x in (-0.15, 0.15):
+        cube(mustache_x, 1.51, 0.39, (0.28, 0.13, 0.09), textures["hair"], -6)
+    for eye_x in (-0.17, 0.17):
+        eye = project(point(eye_x, 1.75, 0.35), camera)
+        if eye:
+            pygame.draw.circle(screen, WHITE, eye, 5)
+            pygame.draw.circle(screen, (45, 89, 175), (eye[0], eye[1] + 1), 2)
+    for button_x in (-0.20, 0.20):
+        button = project(point(button_x, 1.04, 0.40), camera)
+        if button:
+            pygame.draw.circle(screen, GOLD, button, 4)
+            pygame.draw.circle(screen, (174, 113, 28), button, 1)
+    badge = project(point(0, 2.06, 0.39), camera)
+    if badge:
+        pygame.draw.circle(screen, WHITE, badge, 7)
+        pygame.draw.lines(screen, RED, False, ((badge[0] - 3, badge[1] + 3), (badge[0] - 3, badge[1] - 3), badge, (badge[0] + 3, badge[1] - 3), (badge[0] + 3, badge[1] + 3)), 2)
+
+
 class Player:
     def __init__(self):
         self.x, self.y, self.z = 0.0, 1.5, 5.0
         self.velocity_y = 0.0
         self.on_ground = True
         self.lives = 3
+        self.facing_yaw = 0.0
+        self.ground_y = 1.5
 
     def respawn(self):
         self.x, self.y, self.z = 0.0, 1.5, 5.0
         self.velocity_y = 0.0
         self.on_ground = True
+        self.ground_y = 1.5
 
     def update(self, keys, platforms, sounds, camera_yaw=0):
         speed = 0.11
@@ -461,18 +774,24 @@ class Player:
         right_z = -math.sin(camera_yaw) * speed
         forward_x = math.sin(camera_yaw) * speed
         forward_z = math.cos(camera_yaw) * speed
+        move_x = 0.0
+        move_z = 0.0
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            self.x -= right_x
-            self.z -= right_z
+            move_x -= right_x
+            move_z -= right_z
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            self.x += right_x
-            self.z += right_z
+            move_x += right_x
+            move_z += right_z
         if keys[pygame.K_UP] or keys[pygame.K_w]:
-            self.x += forward_x
-            self.z += forward_z
+            move_x += forward_x
+            move_z += forward_z
         if keys[pygame.K_DOWN] or keys[pygame.K_s]:
-            self.x -= forward_x
-            self.z -= forward_z
+            move_x -= forward_x
+            move_z -= forward_z
+        if move_x or move_z:
+            self.x += move_x
+            self.z += move_z
+            self.facing_yaw = math.atan2(move_x, move_z)
         if keys[pygame.K_SPACE] and self.on_ground:
             self.velocity_y = 0.23
             self.on_ground = False
@@ -492,28 +811,24 @@ class Player:
         if landing_height is not None:
             self.y = landing_height
             self.velocity_y = 0
+            self.ground_y = landing_height
         self.x = max(-4.3, min(4.3, self.x))
 
-    def draw(self, screen, camera, textures):
-        draw_shadow(screen, camera, self.x, self.z, 0.62)
-        draw_3d_line(screen, camera, (self.x - 0.38, self.y + 1.0, self.z), (self.x - 0.7, self.y + 0.48, self.z - 0.02), (247, 190, 140), 7)
-        draw_3d_line(screen, camera, (self.x + 0.38, self.y + 1.0, self.z), (self.x + 0.7, self.y + 0.48, self.z - 0.02), (247, 190, 140), 7)
-        draw_model_cube(screen, camera, (self.x - 0.22, self.y + 0.03, self.z), (0.3, 0.48, 0.42), textures["overalls"], -4)
-        draw_model_cube(screen, camera, (self.x + 0.22, self.y + 0.03, self.z), (0.3, 0.48, 0.42), textures["overalls"], -4)
-        draw_model_cube(screen, camera, (self.x, self.y + 0.42, self.z), (0.78, 0.68, 0.62), textures["overalls"], 0)
-        draw_model_cube(screen, camera, (self.x, self.y + 0.92, self.z), (0.7, 0.48, 0.58), textures["mario"], 0)
-        draw_model_cube(screen, camera, (self.x, self.y + 1.35, self.z), (0.7, 0.62, 0.62), textures["skin"], 3)
-        draw_model_cube(screen, camera, (self.x, self.y + 1.67, self.z), (0.78, 0.28, 0.7), textures["cap"], 1)
-        draw_model_cube(screen, camera, (self.x - 0.29, self.y + 0.02, self.z - 0.03), (0.48, 0.22, 0.75), textures["shoe"], 0)
-        draw_model_cube(screen, camera, (self.x + 0.29, self.y + 0.02, self.z - 0.03), (0.48, 0.22, 0.75), textures["shoe"], 0)
-        for eye_x in (self.x - 0.16, self.x + 0.16):
-            eye = project((eye_x, self.y + 1.43, self.z - 0.32), camera)
-            if eye:
-                pygame.draw.circle(screen, INK, eye, 3)
-        mustache_left = project((self.x - 0.18, self.y + 1.26, self.z - 0.33), camera)
-        mustache_right = project((self.x + 0.18, self.y + 1.26, self.z - 0.33), camera)
-        if mustache_left and mustache_right:
-            pygame.draw.line(screen, INK, mustache_left, mustache_right, 4)
+    def draw(self, screen, camera, textures, graphics_quality=2):
+        draw_mario_model(screen, camera, self.x, self.y, self.z, textures, self.facing_yaw,
+                         ground_y=self.ground_y, graphics_quality=graphics_quality)
+
+
+def third_person_camera(player, yaw, look_pitch):
+    """Keep a fixed, player-centered follow camera aimed at Mario."""
+    follow_distance = 7.0
+    camera_height = 3.2
+    target_height = 1.25
+    camera_x = player.x - math.sin(yaw) * follow_distance
+    camera_y = player.y + camera_height
+    camera_z = player.z - math.cos(yaw) * follow_distance
+    target_pitch = math.atan2(target_height - camera_height, follow_distance)
+    return (camera_x, camera_y, camera_z, yaw, target_pitch + look_pitch * 0.35)
 
 
 class Enemy:
@@ -523,16 +838,42 @@ class Enemy:
         self.kind = "koopa" if int(z) % 3 == 0 else "goomba"
         self.speed = 0.025 if self.kind == "goomba" else 0.035
         self.phase = random.random() * math.tau
+        self.animation_time = (random.random() * GOOMBA_ANIMATION["duration"]
+                              if GOOMBA_ANIMATION else 0.0)
+        # Both enemy types patrol along the course, turning around at its ends.
+        self.axis = "z"
 
-    def update(self):
+    def update(self, platforms=()):
         self.phase += 0.12
-        self.x += self.direction * self.speed
-        if abs(self.x) > 3.7:
+        if GOOMBA_ANIMATION:
+            self.animation_time = (self.animation_time + 1 / FPS) % GOOMBA_ANIMATION["duration"]
+        next_z = self.z + self.direction * self.speed
+        blocked = next_z < 4.5 or next_z > WORLD_END - 4.5
+        # Treat raised level blocks as solid obstacles. The ground platform is
+        # support, not a wall, so only blocks that overlap the enemy's body stop it.
+        for px, py, pz, width, height, depth in platforms:
+            if py + height <= self.y + 0.02 or py >= self.y + 1.2:
+                continue
+            if (abs(self.x - px) < (width + 1.25) / 2
+                    and abs(next_z - pz) < (depth + 0.9) / 2
+                    and self.y < py + height):
+                blocked = True
+                break
+        if blocked:
             self.direction *= -1
+        else:
+            self.z = next_z
 
-    def draw(self, screen, camera, textures):
+    def overlaps_player(self, player):
+        """Check horizontal contact and vertical body overlap separately."""
+        horizontal_distance = math.hypot(player.x - self.x, player.z - self.z)
+        vertical_overlap = player.y < self.y + 1.2 and player.y + 1.7 > self.y
+        return horizontal_distance < 0.9 and vertical_overlap
+
+    def draw(self, screen, camera, textures, graphics_quality=2):
         bob = math.sin(self.phase) * 0.035
-        draw_shadow(screen, camera, self.x, self.z, 0.75)
+        if graphics_quality >= 2:
+            draw_shadow(screen, camera, self.x, self.z, 0.75, self.y)
         if self.kind == "koopa":
             draw_model_cube(screen, camera, (self.x, self.y + 0.38 + bob, self.z), (1.35, 1.0, 0.9), textures["shell"], 0)
             draw_model_cube(screen, camera, (self.x, self.y + 1.05 + bob, self.z - 0.18), (0.62, 0.65, 0.62), textures["skin"], 5)
@@ -544,26 +885,89 @@ class Enemy:
             draw_3d_line(screen, camera, (self.x - 0.36, self.y + 0.02, self.z - 0.1), (self.x - 0.62, self.y - 0.03, self.z - 0.27), (247, 190, 140), 7)
             draw_3d_line(screen, camera, (self.x + 0.36, self.y + 0.02, self.z - 0.1), (self.x + 0.62, self.y - 0.03, self.z - 0.27), (247, 190, 140), 7)
         else:
-            draw_model_cube(screen, camera, (self.x, self.y + 0.15 + bob, self.z), (1.25, 0.72, 1.0), textures["enemy"], 0)
-            draw_model_cube(screen, camera, (self.x, self.y + 0.68 + bob, self.z), (1.0, 0.72, 0.9), textures["enemy"], 6)
-            for eye_x in (self.x - 0.24, self.x + 0.24):
-                eye = project((eye_x, self.y + 0.88 + bob, self.z - 0.46), camera)
-                if eye:
-                    pygame.draw.circle(screen, WHITE, eye, 7)
-                    pygame.draw.circle(screen, INK, (eye[0], eye[1] + 1), 3)
+            if GOOMBA_ANIMATION and textures.get("goomba_model"):
+                frames = GOOMBA_ANIMATION["frames"]
+                frame_index = min(len(frames) - 1, int(
+                    self.animation_time / GOOMBA_ANIMATION["duration"] * len(frames)))
+                vertices = frames[frame_index]
+                indices = GOOMBA_ANIMATION["indices"]
+                uvs = GOOMBA_ANIMATION["uvs"]
+                texture = textures["goomba_model"]
+                polygons = []
+                facing = 1 if self.direction > 0 else -1
+                for index in range(0, len(indices) - 2, 3):
+                    triangle = indices[index:index + 3]
+                    points3 = []
+                    for vertex_index in triangle:
+                        vx, vy, vz = vertices[vertex_index]
+                        points3.append((self.x + vx * facing,
+                                        self.y + vy + bob,
+                                        self.z + vz * facing))
+                    points2 = [project(point, camera) for point in points3]
+                    if not all(points2):
+                        continue
+                    u = sum(uvs[i][0] for i in triangle) / 3
+                    v = sum(uvs[i][1] for i in triangle) / 3
+                    tx = int((u % 1.0) * (texture.get_width() - 1))
+                    ty = int(((1 - v) % 1.0) * (texture.get_height() - 1))
+                    color = (texture.get_at((tx, ty))[:3] if graphics_quality >= 1
+                             else (155, 70, 30))
+                    depth = sum(camera_space_depth(point, camera) for point in points3) / 3
+                    polygons.append((depth, points2, color))
+                for _, polygon, color in sorted(polygons, key=lambda item: item[0], reverse=True):
+                    pygame.draw.polygon(screen, color, polygon)
+                # Put the atlas face back over the coarse triangle samples: the
+                # white eye texels should remain eyes, not fill the entire face.
+                face = textures.get("enemy_face")
+                face_y = self.y + 0.76 + bob
+                face_z = self.z + facing * 0.49
+                face_top = project((self.x, face_y + 0.35, face_z), camera)
+                face_bottom = project((self.x, face_y - 0.35, face_z), camera)
+                face_left = project((self.x - 0.42, face_y, face_z), camera)
+                face_right = project((self.x + 0.42, face_y, face_z), camera)
+                if face and face_top and face_bottom and face_left and face_right:
+                    face_width = max(1, abs(face_right[0] - face_left[0]))
+                    face_height = max(1, abs(face_bottom[1] - face_top[1]))
+                    face_sprite = pygame.transform.smoothscale(face, (face_width, face_height))
+                    if facing < 0:
+                        face_sprite = pygame.transform.flip(face_sprite, True, False)
+                    screen.blit(face_sprite, (min(face_left[0], face_right[0]), face_top[1]))
+                return
+
+            # Draw the Goomba as one rounded body in screen space. The cube-only
+            # body made the face atlas look like a sticker on a pair of blocks.
+            body_top = project((self.x, self.y + 1.2 + bob, self.z - 0.47), camera)
+            body_bottom = project((self.x, self.y + 0.03 + bob, self.z - 0.47), camera)
+            body_left = project((self.x - 0.62, self.y + 0.62 + bob, self.z - 0.47), camera)
+            body_right = project((self.x + 0.62, self.y + 0.62 + bob, self.z - 0.47), camera)
+            if body_top and body_bottom and body_left and body_right:
+                body_width = max(1, abs(body_right[0] - body_left[0]))
+                body_height = max(1, abs(body_bottom[1] - body_top[1]))
+                body_rect = pygame.Rect(body_left[0], body_top[1], body_width, body_height)
+                pygame.draw.ellipse(screen, (116, 53, 25), body_rect)
+                pygame.draw.ellipse(screen, (151, 70, 30), body_rect.inflate(-body_width // 7, -body_height // 10))
+                foot_y = body_bottom[1] - max(2, body_height // 12)
+                foot_width = max(3, body_width // 3)
+                foot_height = max(2, body_height // 8)
+                pygame.draw.ellipse(screen, (47, 27, 24), (body_rect.centerx - foot_width - 2, foot_y, foot_width, foot_height))
+                pygame.draw.ellipse(screen, (47, 27, 24), (body_rect.centerx + 2, foot_y, foot_width, foot_height))
+            face = textures.get("enemy_face")
+            face_top = project((self.x, self.y + 1.10 + bob, self.z - 0.47), camera)
+            face_bottom = project((self.x, self.y + 0.38 + bob, self.z - 0.47), camera)
+            face_left = project((self.x - 0.43, self.y + 0.74 + bob, self.z - 0.47), camera)
+            face_right = project((self.x + 0.43, self.y + 0.74 + bob, self.z - 0.47), camera)
+            if face and face_top and face_bottom and face_left and face_right:
+                face_width = max(1, abs(face_right[0] - face_left[0]))
+                face_height = max(1, abs(face_bottom[1] - face_top[1]))
+                face_sprite = pygame.transform.smoothscale(face, (face_width, face_height))
+                screen.blit(face_sprite, (face_left[0], face_top[1]))
             draw_3d_line(screen, camera, (self.x - 0.45, self.y + 0.03, self.z - 0.16), (self.x - 0.7, self.y - 0.02, self.z - 0.3), INK, 8)
             draw_3d_line(screen, camera, (self.x + 0.45, self.y + 0.03, self.z - 0.16), (self.x + 0.7, self.y - 0.02, self.z - 0.3), INK, 8)
 
 
-def draw_remote_player(screen, camera, player, textures, font):
+def draw_remote_player(screen, camera, player, textures, font, graphics_quality=2):
     x, y, z = player["x"], player["y"], player["z"]
-    draw_shadow(screen, camera, x, z, 0.62)
-    draw_model_cube(screen, camera, (x - 0.22, y + 0.03, z), (0.3, 0.48, 0.42), textures["overalls"], -4)
-    draw_model_cube(screen, camera, (x + 0.22, y + 0.03, z), (0.3, 0.48, 0.42), textures["overalls"], -4)
-    draw_model_cube(screen, camera, (x, y + 0.42, z), (0.78, 0.68, 0.62), textures["overalls"])
-    draw_model_cube(screen, camera, (x, y + 0.92, z), (0.7, 0.48, 0.58), textures["mario"])
-    draw_model_cube(screen, camera, (x, y + 1.35, z), (0.7, 0.62, 0.62), textures["skin"], 3)
-    draw_model_cube(screen, camera, (x, y + 1.67, z), (0.78, 0.28, 0.7), textures["cap"], 1)
+    draw_mario_model(screen, camera, x, y, z, textures, graphics_quality=graphics_quality)
 
 
 def draw_nameplate(screen, camera, x, y, z, name, font, color=WHITE):
@@ -609,14 +1013,61 @@ def draw_leaderboard(screen, font, local_name, local_z, remote_players):
     screen.blit(panel, (SCREEN_WIDTH - panel.get_width() - 14, 58))
 
 
-def draw_first_person_hands(screen, jumping):
-    hand_offset = int(max(0, jumping) * 8)
-    pygame.draw.polygon(screen, BLUE, [(0, SCREEN_HEIGHT), (0, SCREEN_HEIGHT - 78 - hand_offset), (115, SCREEN_HEIGHT - 26 - hand_offset), (150, SCREEN_HEIGHT)])
-    pygame.draw.polygon(screen, RED, [(0, SCREEN_HEIGHT - 78 - hand_offset), (68, SCREEN_HEIGHT - 100 - hand_offset), (126, SCREEN_HEIGHT - 26 - hand_offset), (115, SCREEN_HEIGHT - 26 - hand_offset)])
-    pygame.draw.circle(screen, (247, 190, 140), (72, SCREEN_HEIGHT - 88 - hand_offset), 18)
-    pygame.draw.polygon(screen, BLUE, [(SCREEN_WIDTH, SCREEN_HEIGHT), (SCREEN_WIDTH, SCREEN_HEIGHT - 78 - hand_offset), (SCREEN_WIDTH - 115, SCREEN_HEIGHT - 26 - hand_offset), (SCREEN_WIDTH - 150, SCREEN_HEIGHT)])
-    pygame.draw.polygon(screen, RED, [(SCREEN_WIDTH, SCREEN_HEIGHT - 78 - hand_offset), (SCREEN_WIDTH - 68, SCREEN_HEIGHT - 100 - hand_offset), (SCREEN_WIDTH - 126, SCREEN_HEIGHT - 26 - hand_offset), (SCREEN_WIDTH - 115, SCREEN_HEIGHT - 26 - hand_offset)])
-    pygame.draw.circle(screen, (247, 190, 140), (SCREEN_WIDTH - 72, SCREEN_HEIGHT - 88 - hand_offset), 18)
+def draw_first_person_hands(screen, camera, textures, graphics_quality=2):
+    """Draw the rig's static glove meshes as view-locked first-person hands."""
+    if MARIO_MESHES and MARIO_HAND_MESHES:
+        vertices = [vertex for positions, _, _, _, _ in MARIO_MESHES for vertex in positions]
+        min_x, max_x = min(v[0] for v in vertices), max(v[0] for v in vertices)
+        min_y, max_y = min(v[1] for v in vertices), max(v[1] for v in vertices)
+        scale = 2.1 / max(0.001, max_y - min_y)
+        center_x = (min_x + max_x) / 2
+        yaw = camera[3] if len(camera) > 3 else 0.0
+        pitch = camera[4] if len(camera) > 4 else 0.0
+        right = (math.cos(yaw), 0.0, -math.sin(yaw))
+        up = (-math.sin(yaw) * math.sin(pitch), math.cos(pitch),
+              -math.cos(yaw) * math.sin(pitch))
+        forward = (math.sin(yaw) * math.cos(pitch), math.sin(pitch),
+                   math.cos(yaw) * math.cos(pitch))
+        material_textures = textures.get("mario_materials", ())
+        polygons = []
+        for positions, indices, base_color, uvs, material_index in MARIO_HAND_MESHES:
+            hand_center = tuple(sum(vertex[axis] for vertex in positions) / len(positions)
+                                for axis in range(3))
+            hand_side = 1 if hand_center[0] >= center_x else -1
+            anchor_x, anchor_y, anchor_depth = hand_side * 0.62, -0.43, 1.45
+            points3 = []
+            for vx, vy, vz in positions:
+                local_x = anchor_x + (vx - hand_center[0]) * scale
+                local_y = anchor_y + (vy - hand_center[1]) * scale
+                local_depth = anchor_depth + (vz - hand_center[2]) * scale
+                points3.append(tuple(camera[axis] + right[axis] * local_x
+                                     + up[axis] * local_y + forward[axis] * local_depth
+                                     for axis in range(3)))
+            material_texture = (material_textures[material_index]
+                                if material_index < len(material_textures) else None)
+            if graphics_quality < 2 or material_index == 3:
+                material_texture = None
+            for index in range(0, len(indices) - 2, 3):
+                triangle_indices = indices[index:index + 3]
+                points2 = [project(points3[vertex_index], camera)
+                           for vertex_index in triangle_indices]
+                if not all(point is not None for point in points2):
+                    continue
+                depth = sum(camera_space_depth(points3[vertex_index], camera)
+                            for vertex_index in triangle_indices) / 3
+                face_color = base_color
+                if material_texture:
+                    u = sum(uvs[i][0] for i in triangle_indices) / 3
+                    v = sum(uvs[i][1] for i in triangle_indices) / 3
+                    tx = int((u % 1.0) * (material_texture.get_width() - 1))
+                    ty = int(((1 - v) % 1.0) * (material_texture.get_height() - 1))
+                    texel = material_texture.get_at((tx, ty))
+                    if texel.a < 16:
+                        continue
+                    face_color = tuple(texel[channel] for channel in range(3))
+                polygons.append((depth, points2, face_color))
+        for _, polygon, color in sorted(polygons, key=lambda item: item[0], reverse=True):
+            pygame.draw.polygon(screen, color, polygon)
     pygame.draw.line(screen, WHITE, (SCREEN_WIDTH // 2 - 8, SCREEN_HEIGHT // 2), (SCREEN_WIDTH // 2 + 8, SCREEN_HEIGHT // 2), 2)
     pygame.draw.line(screen, WHITE, (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 8), (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 8), 2)
 
@@ -684,20 +1135,32 @@ def draw_text(screen, font, text, position, color=WHITE):
 
 
 def draw_background(screen, camera, graphics_quality=2):
+    graphics_quality = max(0, min(4, graphics_quality))
     pitch = camera[4] if len(camera) > 4 else 0
     horizon_shift = int(pitch * 90)
-    for row in range(SCREEN_HEIGHT):
-        blend = min(1, row / max(1, 360 + horizon_shift))
-        color = tuple(int(SKY[channel] * (1 - blend) + (53, 121, 151)[channel] * blend) for channel in range(3))
-        pygame.draw.line(screen, color, (0, row), (SCREEN_WIDTH, row))
-    pygame.draw.circle(screen, (255, 235, 151), (780, 98 + horizon_shift // 3), 48)
+    if graphics_quality == 0:
+        screen.fill((92, 180, 235))
+    else:
+        for row in range(SCREEN_HEIGHT):
+            blend = min(1, row / max(1, 360 + horizon_shift))
+            color = tuple(int(SKY[channel] * (1 - blend) + (53, 121, 151)[channel] * blend) for channel in range(3))
+            pygame.draw.line(screen, color, (0, row), (SCREEN_WIDTH, row))
+    sun = (780, 98 + horizon_shift // 3)
+    if graphics_quality >= 3:
+        pygame.draw.circle(screen, (255, 221, 123), sun, 64)
+        pygame.draw.circle(screen, (255, 231, 148), sun, 55)
+    pygame.draw.circle(screen, (255, 235, 151), sun, 35 + graphics_quality * 3)
     yaw = camera[3] if len(camera) > 3 else 0
     cloud_data = ((150, 110, 1.0), (420, 75, 0.8), (780, 155, 1.25), (1110, 95, 0.7))
-    for cloud_index, (cloud_x, cloud_y, cloud_scale) in enumerate(cloud_data[:max(1, graphics_quality + 1)]):
+    cloud_counts = (1, 2, 3, 4, 4)
+    for cloud_index, (cloud_x, cloud_y, cloud_scale) in enumerate(cloud_data[:cloud_counts[graphics_quality]]):
         x = int((cloud_x - math.sin(yaw) * 150 - camera[0] * 18) % (SCREEN_WIDTH + 220) - 110)
         y = cloud_y + horizon_shift // 4
         radius = int(24 * cloud_scale)
         cloud_color = (245, 250, 255)
+        if graphics_quality >= 3:
+            shade_color = (207, 231, 245)
+            pygame.draw.ellipse(screen, shade_color, (x, y + 5, radius * 2, radius))
         pygame.draw.circle(screen, cloud_color, (x, y), radius)
         pygame.draw.circle(screen, cloud_color, (x + radius, y + 6), int(radius * 1.25))
         pygame.draw.circle(screen, cloud_color, (x + radius * 2, y), int(radius * 0.9))
@@ -705,7 +1168,12 @@ def draw_background(screen, camera, graphics_quality=2):
         pygame.draw.polygon(screen, (82, 177, 113), [(0, 330 + horizon_shift), (170, 215 + horizon_shift), (360, 330 + horizon_shift)])
         pygame.draw.polygon(screen, (70, 163, 102), [(430, 330 + horizon_shift), (700, 190 + horizon_shift), (980, 330 + horizon_shift)])
     ground_top = max(300, 330 + horizon_shift)
-    pygame.draw.rect(screen, (56, 149, 78), (0, ground_top, SCREEN_WIDTH, SCREEN_HEIGHT - ground_top))
+    ground_color = (42, 126, 65) if graphics_quality == 0 else (56, 149, 78)
+    pygame.draw.rect(screen, ground_color, (0, ground_top, SCREEN_WIDTH, SCREEN_HEIGHT - ground_top))
+    if graphics_quality >= 4:
+        for stripe in range(1, 6):
+            y = ground_top + stripe * (SCREEN_HEIGHT - ground_top) // 6
+            pygame.draw.line(screen, (60, 156, 81), (0, y), (SCREEN_WIDTH, y), 1)
 
 
 def draw_ground_plane(screen, camera, graphics_quality=2):
@@ -715,20 +1183,72 @@ def draw_ground_plane(screen, camera, graphics_quality=2):
         pygame.draw.polygon(screen, floor_colors[index % len(floor_colors)], polygon)
 
 
-def draw_world(screen, camera, platforms, coins, enemies, goal_z, textures):
+def floor_tile_polygon(x0, x1, y, z0, z1, camera):
+    """Return a projected top-face tile with its camera depth."""
+    vertices = ((x0, y, z0), (x1, y, z0), (x1, y, z1), (x0, y, z1))
+    yaw = camera[3] if len(camera) > 3 else 0
+    pitch = camera[4] if len(camera) > 4 else 0
+    depths = []
+    for vertex_x, vertex_y, vertex_z in vertices:
+        relative_x = vertex_x - camera[0]
+        relative_z = vertex_z - camera[2]
+        flat_depth = relative_x * math.sin(yaw) + relative_z * math.cos(yaw)
+        depths.append(flat_depth * math.cos(pitch) + (vertex_y - camera[1]) * math.sin(pitch))
+    if min(depths) <= 0.45:
+        return None
+    polygon = [project(vertex, camera) for vertex in vertices]
+    if None in polygon:
+        return None
+    return sum(depths) / len(depths), polygon
+
+
+def add_floor_texture_tiles(objects, platform, camera, texture, tile_size=1.25):
+    """Project a repeated floor texture as small colored tiles."""
+    px, py, pz, width, height, depth = platform
+    columns = math.ceil(width / tile_size)
+    rows = math.ceil(depth / tile_size)
+    left = px - width / 2
+    near = pz - depth / 2
+    texture_width, texture_height = texture.get_size()
+    repeat_world_units = 2.5
+    for column in range(columns):
+        x0 = left + column * tile_size
+        x1 = min(left + width, x0 + tile_size)
+        texture_x = int((((column * tile_size + tile_size / 2) % repeat_world_units)
+                         / repeat_world_units) * (texture_width - 1))
+        for row in range(rows):
+            z0 = near + row * tile_size
+            z1 = min(near + depth, z0 + tile_size)
+            tile = floor_tile_polygon(x0, x1, py + height + 0.01, z0, z1, camera)
+            if tile:
+                texture_y = int((((row * tile_size + tile_size / 2) % repeat_world_units)
+                                 / repeat_world_units) * (texture_height - 1))
+                objects.append((*tile, texture.get_at((texture_x, texture_y))[:3]))
+
+
+def draw_world(screen, camera, platforms, coins, enemies, goal_z, textures, graphics_quality=2):
     objects = []
     for platform_index, platform in enumerate(platforms):
         px, py, pz, width, height, depth = platform
-        texture = textures["grass"] if py == 0 else textures["brick"]
+        texture = textures["floor"] if py == 0 else textures["brick"]
         color = texture_color(texture, pz, platform_index)
         if py == 0 and depth > 20:
+            tile_sizes = (0, 1.25, 0.55, 0.4, 0.25)
+            tile_size = tile_sizes[max(0, min(4, graphics_quality))]
             chunk_depth = 8.2
-            first_chunk = pz - depth / 2 + chunk_depth / 2
             chunk_count = math.ceil(depth / chunk_depth)
+            ground_near = pz - depth / 2
             for chunk_index in range(chunk_count):
-                chunk_z = first_chunk + chunk_index * chunk_depth
-                objects.extend((depth_value, polygon, color)
-                               for depth_value, polygon in cube_polygons((px, py, chunk_z), (width, height, chunk_depth), camera))
+                chunk_start = ground_near + chunk_index * chunk_depth
+                actual_depth = min(chunk_depth, depth - chunk_index * chunk_depth)
+                if actual_depth > 0:
+                    chunk_z = chunk_start + actual_depth / 2
+                    objects.extend((depth_value, polygon, color)
+                                   for depth_value, polygon in cube_polygons(
+                                       (px, py, chunk_z), (width, height, actual_depth), camera,
+                                       exclude_top=bool(tile_size)))
+            if tile_size:
+                add_floor_texture_tiles(objects, platform, camera, texture, tile_size)
         else:
             objects.extend((depth_value, polygon, color) for depth_value, polygon in cube_polygons((px, py, pz), (width, height, depth), camera))
     for _, polygon, color in sorted(objects, key=lambda item: item[0], reverse=True):
@@ -736,9 +1256,19 @@ def draw_world(screen, camera, platforms, coins, enemies, goal_z, textures):
     for coin in coins:
         point = project(coin, camera)
         if point:
-            radius = max(3, int(FOCAL_LENGTH / max(coin[2] - camera[2], 1) * 0.18))
-            pygame.draw.circle(screen, texture_color(textures["coin"], coin[2], 0), point, radius)
-            pygame.draw.circle(screen, (255, 239, 115), point, max(2, radius // 2))
+            radius = max(3, int(FOCAL_LENGTH / max(camera_space_depth(coin, camera), 1) * 0.18))
+            coin_sprite = textures.get("coin_sprite")
+            if coin_sprite:
+                height = max(14, radius * 4)
+                width = max(8, int(height * coin_sprite.get_width() / coin_sprite.get_height()))
+                size = (width, height)
+                sprite_cache = textures["coin_sprite_cache"]
+                if size not in sprite_cache:
+                    sprite_cache[size] = pygame.transform.smoothscale(coin_sprite, size)
+                screen.blit(sprite_cache[size], (point[0] - width // 2, point[1] - height // 2))
+            else:
+                pygame.draw.circle(screen, texture_color(textures["coin"], coin[2], 0), point, radius)
+                pygame.draw.circle(screen, (255, 239, 115), point, max(2, radius // 2))
     goal_base = project((0, 0, goal_z), camera)
     goal_top = project((0, 6, goal_z), camera)
     if goal_base and goal_top:
@@ -861,8 +1391,8 @@ def draw_menu(screen, title_font, font, small_font, name, address, mode, focus, 
         pygame.draw.rect(screen, GOLD, overlay, 3, border_radius=14)
         draw_text(screen, title_font, "MULTIPLAYER GUIDE", (286, 91), GOLD)
         draw_text(screen, font, "1. Host: choose F2 HOST, then press ENTER.", (155, 175), WHITE)
-        draw_text(screen, font, "2. Share your computer's IP address with friends.", (155, 215), WHITE)
-        draw_text(screen, font, "3. Join: choose F3 JOIN, enter the host IP, press ENTER.", (155, 255), WHITE)
+        draw_text(screen, font, "2. Share your computer's IP and UDP port 50007.", (155, 215), WHITE)
+        draw_text(screen, font, "3. Join: enter the host IP and port, then click CONNECT.", (155, 255), WHITE)
         draw_text(screen, font, "4. Allow UDP port 50007 through the host firewall.", (155, 295), WHITE)
         draw_text(screen, small_font, "Everyone must run the same Super Mario PC & Mobile file.", (270, 342), (170, 194, 225))
         draw_text(screen, small_font, "WASD move  |  Mouse look  |  SPACE jump  |  T chat", (250, 370), (170, 194, 225))
@@ -882,6 +1412,12 @@ def draw_menu(screen, title_font, font, small_font, name, address, mode, focus, 
             pygame.draw.rect(screen, (72, 61, 52) if selected else (27, 45, 84), box, border_radius=6)
             pygame.draw.rect(screen, GOLD if selected else (67, 95, 140), box, 2, border_radius=6)
             draw_text(screen, small_font, quality_name, (box.x + 10, box.y + 11), WHITE if selected else (181, 198, 225))
+        quality_help = ("Flat sky, simple surfaces, best speed",
+                        "Coarse textures, fewer details",
+                        "Full textures and shadows",
+                        "Sharper ground and richer sky",
+                        "Finest ground detail and scenery")
+        draw_text(screen, small_font, quality_help[max(0, min(4, graphics_quality))], (205, 269), (181, 198, 225))
         draw_text(screen, font, "CAMERA MODE", (205, 295), WHITE)
         first_box = pygame.Rect(205, 335, 180, 40)
         third_box = pygame.Rect(420, 335, 180, 40)
@@ -918,10 +1454,15 @@ def draw_menu(screen, title_font, font, small_font, name, address, mode, focus, 
             pygame.draw.rect(screen, GOLD if active else (67, 95, 140), box, 2, border_radius=6)
             draw_text(screen, small_font, label, (220, y + 11), (153, 176, 216))
             draw_text(screen, font, value, (350, y + 8), GOLD if active else WHITE)
-        draw_text(screen, small_font, "TAB: switch field   BACKSPACE: erase", (310, 385), (170, 194, 225))
-        close_button = pygame.Rect(330, 420, 130, 28)
+        draw_text(screen, small_font, "Click a field or press TAB to switch; BACKSPACE erases.", (232, 377), (170, 194, 225))
+        draw_text(screen, small_font, "Host must be running HOST; internet play needs UDP 50007 forwarded.", (191, 397), (170, 194, 225))
+        close_button = pygame.Rect(315, 420, 130, 28)
         pygame.draw.rect(screen, RED, close_button, border_radius=7)
-        draw_text(screen, small_font, "CANCEL", (369, 426), WHITE)
+        draw_text(screen, small_font, "CANCEL", (354, 426), WHITE)
+        connect_button = pygame.Rect(475, 420, 140, 28)
+        pygame.draw.rect(screen, (37, 133, 74), connect_button, border_radius=7)
+        pygame.draw.rect(screen, GOLD, connect_button, 2, border_radius=7)
+        draw_text(screen, small_font, "CONNECT", (513, 426), WHITE)
 
 
 def main():
@@ -935,7 +1476,7 @@ def main():
     small_font = pygame.font.Font(None, 22)
     player_name, character_style = load_profile()
     textures = make_textures(character_style)
-    sounds, music = setup_audio()
+    sounds = setup_audio()
     platforms, coin_positions, enemy_positions = make_level()
     player = Player()
     enemies = [Enemy(*enemy) for enemy in enemy_positions]
@@ -974,8 +1515,53 @@ def main():
     mobile_active = False
     running = True
 
+    def start_selected_game():
+        nonlocal network, platforms, coin_positions, remote_players, player, enemies, coins
+        nonlocal menu_error, coins_collected, chat_messages, paused, world_banner, game_state, join_visible
+        if not player_name.strip():
+            menu_error = "Please enter a player name."
+            return
+        if network:
+            network.close()
+            network = None
+        try:
+            selected_port = NetworkSession.port
+            remote_address = host_address.strip() or "127.0.0.1"
+            if game_mode == "join":
+                selected_port = int(join_port)
+                if not 1 <= selected_port <= 65535 or not join_ip.strip():
+                    raise ValueError
+                remote_address = join_ip.strip()
+            if game_mode in ("host", "join"):
+                network = NetworkSession(player_name.strip(), game_mode, remote_address,
+                                         selected_port if game_mode == "join" else NetworkSession.port)
+            new_platforms, new_coins, enemy_positions = make_level(world_id)
+            if game_mode == "test":
+                enemy_positions.extend([(-3, 1.5, 10), (3, 1.5, 20), (0, 1.5, 42), (2.5, 1.5, 62)])
+                remote_players = make_test_npcs()
+            else:
+                remote_players = []
+            platforms, coin_positions = new_platforms, new_coins
+            player = Player()
+            enemies = [Enemy(*enemy) for enemy in enemy_positions]
+            coins = list(coin_positions)
+            menu_error = ""
+            coins_collected = 0
+            chat_messages = []
+            paused = False
+            world_banner = ""
+            join_visible = False
+            game_state = "playing"
+            play_world_theme()
+        except ValueError:
+            menu_error = "Enter a valid host IP and port (1-65535)."
+        except OSError as error:
+            network = None
+            menu_error = f"Network unavailable: {error}"
+
     while running:
         clock.tick(FPS)
+        join_connect_requested = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -1007,7 +1593,9 @@ def main():
                     tutorial_visible = False
                 elif options_visible and pygame.Rect(405, 420, 150, 28).collidepoint(event.pos):
                     options_visible = False
-                elif join_visible and pygame.Rect(330, 420, 130, 28).collidepoint(event.pos):
+                elif join_visible and pygame.Rect(475, 420, 140, 28).collidepoint(event.pos):
+                    join_connect_requested = True
+                elif join_visible and pygame.Rect(315, 420, 130, 28).collidepoint(event.pos):
                     join_visible = False
                 elif join_visible:
                     if pygame.Rect(205, 215, 160, 40).collidepoint(event.pos):
@@ -1117,42 +1705,7 @@ def main():
                     elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                         world_id = event.key - pygame.K_0
                     elif event.key == pygame.K_RETURN:
-                        if join_visible:
-                            try:
-                                join_port_number = int(join_port)
-                                if not 1 <= join_port_number <= 65535:
-                                    raise ValueError
-                                join_visible = False
-                            except (OSError, ValueError):
-                                menu_error = "Enter a valid IP address and port (1-65535)."
-                                continue
-                        else:
-                            join_port_number = NetworkSession.port
-                        if not player_name.strip():
-                            menu_error = "Please enter a player name."
-                            continue
-                        try:
-                            if game_mode != "solo":
-                                if game_mode in ("host", "join"):
-                                    network = NetworkSession(player_name.strip(), game_mode, host_address.strip() or "127.0.0.1", join_port_number if game_mode == "join" else NetworkSession.port)
-                            platforms, coin_positions, enemy_positions = make_level(world_id)
-                            if game_mode == "test":
-                                enemy_positions.extend([(-3, 1.5, 10), (3, 1.5, 20), (0, 1.5, 42), (2.5, 1.5, 62)])
-                                remote_players = make_test_npcs()
-                            else:
-                                remote_players = []
-                            player = Player()
-                            enemies = [Enemy(*enemy) for enemy in enemy_positions]
-                            coins = list(coin_positions)
-                            menu_error = ""
-                            coins_collected = 0
-                            chat_messages = []
-                            paused = False
-                            world_banner = ""
-                            game_state = "playing"
-                        except OSError as error:
-                            network = None
-                            menu_error = f"Network unavailable: {error}"
+                        join_connect_requested = True
                     elif join_visible and event.key == pygame.K_TAB:
                         join_focus = 1 - join_focus
                     elif join_visible and event.key == pygame.K_BACKSPACE:
@@ -1210,6 +1763,9 @@ def main():
                     paused = False
                     world_banner = ""
 
+        if join_connect_requested and game_state == "menu":
+            start_selected_game()
+
         if game_state == "playing" and not paused:
             use_touch = control_mode == "mobile" or (control_mode == "auto" and mobile_active)
             keys = TouchInput(touch_points) if use_touch else pygame.key.get_pressed()
@@ -1225,18 +1781,10 @@ def main():
             camera_yaw += mouse_delta_x * 0.0025
             camera_pitch = max(-0.45, min(0.45, camera_pitch - mouse_delta_y * 0.0025))
             player.update(keys, platforms, sounds, camera_yaw)
-            if network:
-                remote_players = network.update(player.x, player.y, player.z)
-                for message in network.drain_chat():
-                    if message.get("id") != network.player_id:
-                        message["expires"] = time.monotonic() + 5
-                        chat_messages.append(message)
-            elif game_mode == "test":
-                update_test_npcs(remote_players)
             now = time.monotonic()
             chat_messages = [message for message in chat_messages if message["expires"] > now]
             for enemy in enemies:
-                enemy.update()
+                enemy.update(platforms)
             for coin in coins[:]:
                 if math.dist((player.x, player.y, player.z), coin) < 1.1:
                     coins.remove(coin)
@@ -1245,9 +1793,8 @@ def main():
                     if "coin" in sounds:
                         sounds["coin"].play()
             for enemy in enemies[:]:
-                distance = math.dist((player.x, player.y, player.z), (enemy.x, enemy.y, enemy.z))
-                if distance < 1.1:
-                    if player.velocity_y < 0 and player.y > enemy.y + 0.5:
+                if enemy.overlaps_player(player):
+                    if player.velocity_y < 0 and enemy.y + 0.45 < player.y < enemy.y + 1.25:
                         enemies.remove(enemy)
                         player.velocity_y = 0.2
                         score += 250
@@ -1282,13 +1829,23 @@ def main():
                 else:
                     game_state = "win"
 
+        if game_state == "playing":
+            if network:
+                remote_players = network.update(player.x, player.y, player.z)
+                for message in network.drain_chat():
+                    if message.get("id") != network.player_id:
+                        message["expires"] = time.monotonic() + 5
+                        chat_messages.append(message)
+            elif game_mode == "test" and not paused:
+                update_test_npcs(remote_players)
+
         if game_state == "playing" and not paused:
             pygame.mouse.set_visible(False)
             pygame.event.set_grab(True)
             if view_mode == "first":
                 camera = (player.x, player.y + 1.25, player.z - 0.3, camera_yaw, camera_pitch)
             else:
-                camera = (player.x * 0.45, player.y + 3.2, player.z - 7.0, camera_yaw, camera_pitch * 0.7)
+                camera = third_person_camera(player, camera_yaw, camera_pitch)
         elif game_state == "playing":
             pygame.mouse.set_visible(True)
             pygame.event.set_grab(False)
@@ -1296,22 +1853,22 @@ def main():
             if view_mode == "first":
                 camera = (player.x, player.y + 1.25, player.z - 0.3, camera_yaw, camera_pitch)
             else:
-                camera = (player.x * 0.45, player.y + 3.2, player.z - 7.0, camera_yaw, camera_pitch * 0.7)
+                camera = third_person_camera(player, camera_yaw, camera_pitch)
         else:
             pygame.mouse.set_visible(True)
             pygame.event.set_grab(False)
             pygame.mouse.get_rel()
             camera = (player.x * 0.45, 3.4 + max(0, player.y - 1.5) * 0.25, player.z - 8.5)
         draw_background(screen, camera, graphics_quality)
-        draw_world(screen, camera, platforms, coins, enemies, WORLD_END, textures)
+        draw_world(screen, camera, platforms, coins, enemies, WORLD_END, textures, graphics_quality)
         for enemy in enemies:
-            enemy.draw(screen, camera, textures)
+            enemy.draw(screen, camera, textures, graphics_quality)
         for remote_player in remote_players:
-            draw_remote_player(screen, camera, remote_player, textures, small_font)
+            draw_remote_player(screen, camera, remote_player, textures, small_font, graphics_quality)
         if game_state == "playing" and view_mode == "first":
-            draw_first_person_hands(screen, player.y - 1.5)
+            draw_first_person_hands(screen, camera, textures, graphics_quality)
         elif game_state != "playing" or view_mode == "third":
-            player.draw(screen, camera, textures)
+            player.draw(screen, camera, textures, graphics_quality)
         if game_state == "playing" and (control_mode == "mobile" or (control_mode == "auto" and mobile_active)) and not paused:
             draw_touch_controls(screen)
         if game_state == "menu":
